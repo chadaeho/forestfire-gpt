@@ -67,3 +67,43 @@ def burned_area_km2(grid, cell_size_m=100):
     """피해면적 산출 (km²)"""
     burned = ((grid == BURNING) | (grid == BURNED)).sum()
     return burned * (cell_size_m ** 2) / 1_000_000
+
+
+def grid_to_latlon_polygons(grid_history, center_lat, center_lon, cell_size_deg=0.002):
+    """
+    시뮬레이션 결과 격자를 위경도 폴리곤 좌표로 변환
+
+    Returns:
+        시간대별 [{'bounds': [[lat, lon], [lat, lon]], 'state': int}, ...] 리스트
+    """
+    polygons_by_time = []
+    for grid in grid_history:
+        h, w = grid.shape
+        # 격자 중앙을 center로 정렬
+        lat0 = center_lat - (h / 2) * cell_size_deg
+        lon0 = center_lon - (w / 2) * cell_size_deg
+
+        cells = []
+        for i in range(h):
+            for j in range(w):
+                if grid[i, j] in (BURNING, BURNED):
+                    lat = lat0 + i * cell_size_deg
+                    lon = lon0 + j * cell_size_deg
+                    cells.append({
+                        'bounds': [
+                            [lat - cell_size_deg/2, lon - cell_size_deg/2],
+                            [lat + cell_size_deg/2, lon + cell_size_deg/2],
+                        ],
+                        'state': int(grid[i, j]),
+                    })
+        polygons_by_time.append(cells)
+    return polygons_by_time
+
+
+def get_ignition_latlon(ignition_xy, grid_shape, center_lat, center_lon, cell_size_deg=0.002):
+    """발화점 격자 좌표 → 위경도 변환"""
+    x, y = ignition_xy
+    h, w = grid_shape
+    lat0 = center_lat - (h / 2) * cell_size_deg
+    lon0 = center_lon - (w / 2) * cell_size_deg
+    return lat0 + y * cell_size_deg, lon0 + x * cell_size_deg

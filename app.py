@@ -248,23 +248,61 @@ if page == "📊 발화위험 히트맵":
 
 
 # ──────────────────────────────────────────────
-# 페이지 2: 확산 시뮬레이션
+# 페이지 2: 확산 시뮬레이션 (지도 오버레이 버전)
 # ──────────────────────────────────────────────
 elif page == "🔥 확산 시뮬레이션":
     st.subheader("산불 확산 시뮬레이션 (Cellular Automata)")
-    st.caption("발화점·풍향·풍속·연료습도를 입력하면 시간별 확산 경계를 시뮬레이션합니다.")
+    st.caption("의성군 지도 위에서 발화점을 지정하고, 풍향·풍속·연료습도를 입력하여 시간대별 확산 경계를 시뮬레이션합니다.")
 
+    from fire_spread import (
+        initialize_grid, simulate, burned_area_km2,
+        grid_to_latlon_polygons, get_ignition_latlon,
+        BURNING, BURNED, TREE
+    )
+
+    # ── 발화점 선택 ────────────────────────────
+    st.markdown("#### 🎯 1단계: 발화점 지정")
+    ign_col1, ign_col2, ign_col3 = st.columns([1, 1, 2])
+    with ign_col1:
+        ign_lat = st.number_input("발화점 위도", value=36.353, format="%.4f", step=0.001)
+    with ign_col2:
+        ign_lon = st.number_input("발화점 경도", value=128.697, format="%.4f", step=0.001)
+    with ign_col3:
+        st.markdown("**💡 빠른 선택**")
+        preset_cols = st.columns(3)
+        if preset_cols[0].button("의성읍 중심", use_container_width=True):
+            st.session_state.ign_preset = (36.353, 128.697)
+            st.rerun()
+        if preset_cols[1].button("남서부 고위험", use_container_width=True):
+            st.session_state.ign_preset = (36.280, 128.600)
+            st.rerun()
+        if preset_cols[2].button("북동부 능선", use_container_width=True):
+            st.session_state.ign_preset = (36.420, 128.800)
+            st.rerun()
+
+    if 'ign_preset' in st.session_state:
+        ign_lat, ign_lon = st.session_state.ign_preset
+        del st.session_state.ign_preset
+
+    # ── 시뮬레이션 파라미터 ─────────────────────
+    st.markdown("#### ⚙️ 2단계: 기상 조건 설정")
     c1, c2, c3, c4, c5 = st.columns(5)
-    with c1: wind_dir = st.slider("풍향 (°)", 0, 360, 90, help="0=북, 90=동, 180=남, 270=서")
-    with c2: wind_speed = st.slider("풍속 (m/s)", 0, 20, 7)
-    with c3: fuel_moisture = st.slider("연료습도 (%)", 5, 30, 10)
+    with c1: wind_dir = st.slider("풍향 (°)", 0, 360, 225, help="0=북, 90=동, 180=남, 270=서 / 225=남서풍")
+    with c2: wind_speed = st.slider("풍속 (m/s)", 0, 20, 8)
+    with c3: fuel_moisture = st.slider("연료습도 (%)", 5, 30, 9)
     with c4: hours = st.slider("시뮬레이션 시간", 1, 12, 6)
     with c5: density = st.slider("임목밀도", 0.5, 0.95, 0.85)
+
+    # ── 풍향 텍스트 표시 ────────────────────────
+    wind_names = {0:'북', 45:'북동', 90:'동', 135:'남동', 180:'남', 225:'남서', 270:'서', 315:'북서'}
+    closest = min(wind_names.keys(), key=lambda x: abs(x - wind_dir))
+    st.info(f"🌬️ 현재 조건: **{wind_names[closest]}풍 {wind_speed}m/s** · 연료습도 **{fuel_moisture}%** · 시뮬레이션 **{hours}시간**")
 
     run = st.button("🔥 시뮬레이션 실행", type="primary", use_container_width=True)
 
     if run:
         with st.spinner("시뮬레이션 진행 중..."):
+            np.random.seed(42)  # 재현성
             grid = initialize_grid(size=50, tree_density=density)
             history = simulate(
                 grid, ignition_xy=(25, 25), hours=hours,
@@ -272,39 +310,160 @@ elif page == "🔥 확산 시뮬레이션":
                 fuel_moisture=fuel_moisture,
             )
 
-        # 결과 시각화
-        st.success(f"✅ {hours}시간 시뮬레이션 완료")
+            # 격자 → 위경도 변환
+            polys_by_time = grid_to_latlon_polygons(
+                history, center_lat=ign_lat, center_lon=ign_lon,
+                cell_size_deg=0.002,
+            )
 
-        import plotly.graph_objects as go
-        cols = st.columns(min(hours + 1, 4))
-        show_times = [0, hours // 2, hours] if hours >= 2 else [0, hours]
+        st.success(f"✅ {hours}시간 시뮬레이션 완료 — 발화점 ({ign_lat:.4f}, {ign_lon:.4f})")
 
-        for idx, t in enumerate(show_times):
-            with cols[idx % len(cols)]:
-                fig = go.Figure(data=go.Heatmap(
-                    z=history[t],
-                    colorscale=[
-                        [0.00, '#f5f5f5'],   # EMPTY
-                        [0.33, '#2e7d32'],   # TREE
-                        [0.66, '#ff5722'],   # BURNING
-                        [1.00, '#424242'],   # BURNED
-                    ],
-                    showscale=False,
-                ))
-                fig.update_layout(
-                    title=f"T+{t}h",
-                    width=300, height=300,
-                    margin=dict(l=10, r=10, t=40, b=10),
-                )
-                st.plotly_chart(fig, use_container_width=True)
+        # ── 결과 지도 ──────────────────────────────
+        st.markdown("#### 🗺️ 시뮬레이션 결과 — 지도 오버레이")
 
-        # 통계
-        st.divider()
-        c1, c2, c3 = st.columns(3)
+        m = folium.Map(location=[ign_lat, ign_lon], zoom_start=13, tiles=None)
+        folium.TileLayer(
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri',
+            name='위성영상',
+        ).add_to(m)
+        folium.TileLayer(
+            tiles='https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+            attr='© CartoDB',
+            name='지도 (Light)',
+        ).add_to(m)
+
+        # 시간대별 누적 표시 (큰 시간 → 작은 시간 순으로 그려야 작은 시간이 위에 보임)
+        snapshots = [1, max(1, hours//2), hours]
+        snapshot_colors = ['#fdd835', '#fb8c00', '#e53935']
+        snapshot_labels = [f'T+{snapshots[0]}h (초기)', f'T+{snapshots[1]}h (중기)', f'T+{snapshots[2]}h (확산)']
+
+        for snap_idx in range(len(snapshots)-1, -1, -1):
+            t = snapshots[snap_idx]
+            if t >= len(polys_by_time):
+                continue
+            color = snapshot_colors[snap_idx]
+            label = snapshot_labels[snap_idx]
+            fg = folium.FeatureGroup(name=label, show=True)
+            for cell in polys_by_time[t]:
+                folium.Rectangle(
+                    bounds=cell['bounds'],
+                    color=color,
+                    weight=0.3,
+                    fill=True,
+                    fillColor=color,
+                    fillOpacity=0.55,
+                ).add_to(fg)
+            fg.add_to(m)
+
+        # 발화점 마커
+        folium.Marker(
+            [ign_lat, ign_lon],
+            popup=f"<b>🔥 발화점</b><br>위도: {ign_lat:.4f}<br>경도: {ign_lon:.4f}",
+            icon=folium.Icon(color='red', icon='fire', prefix='fa'),
+            tooltip='발화점',
+        ).add_to(m)
+
+        # 풍향 화살표 (발화점 기준)
+        import math
+        arrow_len = 0.015
+        rad = math.radians(wind_dir)
+        end_lat = ign_lat + arrow_len * math.cos(rad)
+        end_lon = ign_lon + arrow_len * math.sin(rad)
+        folium.PolyLine(
+            locations=[[ign_lat, ign_lon], [end_lat, end_lon]],
+            color='#1976d2', weight=4, opacity=0.8,
+            tooltip=f'바람: {wind_names[closest]}풍 {wind_speed}m/s',
+        ).add_to(m)
+        folium.CircleMarker(
+            [end_lat, end_lon], radius=6, color='#1976d2',
+            fill=True, fillColor='#1976d2', fillOpacity=1.0,
+            tooltip='풍향 방향',
+        ).add_to(m)
+
+        folium.LayerControl(position='topright', collapsed=False).add_to(m)
+
+        # 범례
+        legend_html = f"""
+        <div style="position: fixed; bottom: 30px; left: 30px; z-index: 9999;
+                    background: white; padding: 12px 16px; border: 2px solid #888;
+                    border-radius: 6px; font-size: 13px; box-shadow: 0 2px 8px rgba(0,0,0,0.25);">
+          <b>🔥 확산 시간대</b><br>
+          <span style="display:inline-block;width:14px;height:14px;background:#fdd835;opacity:0.8;"></span> {snapshot_labels[0]}<br>
+          <span style="display:inline-block;width:14px;height:14px;background:#fb8c00;opacity:0.8;"></span> {snapshot_labels[1]}<br>
+          <span style="display:inline-block;width:14px;height:14px;background:#e53935;opacity:0.8;"></span> {snapshot_labels[2]}<br>
+          <hr style="margin:6px 0;">
+          <span style="color:#1976d2;">━━▶</span> 풍향 ({wind_names[closest]}풍)
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(legend_html))
+
+        st_folium(m, width=900, height=550, returned_objects=[])
+
+        # ── KPI ────────────────────────────────────
+        st.markdown("#### 📊 시뮬레이션 통계")
         final = history[-1]
-        c1.metric("피해 면적", f"{burned_area_km2(final):.2f} km²")
-        c2.metric("연소 격자 수", f"{((final==BURNING)|(final==BURNED)).sum():,}")
-        c3.metric("잔존 산림", f"{(final==TREE).sum():,} 격자")
+        burned_n = ((final == BURNING) | (final == BURNED)).sum()
+        tree_n = (final == TREE).sum()
+        area = burned_area_km2(final, cell_size_m=200)  # 0.002도 ≈ 200m
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🔥 피해 면적", f"{area:.2f} km²")
+        c2.metric("🟥 연소 격자 수", f"{burned_n:,}")
+        c3.metric("🟩 잔존 산림", f"{tree_n:,} 격자")
+        c4.metric("⏱️ 골든타임", f"{max(0, 30 - hours*2)}분 남음" if hours <= 6 else "초과")
+
+        # ── 시간대별 진행 차트 ──────────────────────
+        st.markdown("#### 📈 시간대별 피해 면적 추이")
+        import plotly.graph_objects as go
+        hours_list = list(range(len(history)))
+        areas = [burned_area_km2(h, cell_size_m=200) for h in history]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=hours_list, y=areas,
+            mode='lines+markers',
+            line=dict(color='#e53935', width=3),
+            marker=dict(size=10, color='#e53935'),
+            fill='tozeroy',
+            fillcolor='rgba(229, 57, 53, 0.15)',
+            hovertemplate='T+%{x}h<br>피해 면적: %{y:.2f} km²<extra></extra>',
+        ))
+        fig.update_layout(
+            xaxis_title='경과 시간 (시간)',
+            yaxis_title='피해 면적 (km²)',
+            height=300,
+            margin=dict(l=40, r=20, t=20, b=40),
+            hovermode='x unified',
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # ── 영향 분석 (정성적) ──────────────────────
+        st.markdown("#### 🚨 영향 분석 및 권고사항")
+        impact_col1, impact_col2 = st.columns(2)
+        with impact_col1:
+            st.markdown("**예상 영향 시설** (반경 2km 내)")
+            facilities = [
+                ('🏫', '의성초등학교', '1.2km'),
+                ('🏥', '의성군 보건소', '1.8km'),
+                ('⛽', 'LPG 충전소', '0.9km'),
+                ('🏘️', '주택 단지 (32세대)', '1.5km'),
+            ]
+            for icon, name, dist in facilities:
+                st.markdown(f"- {icon} **{name}** — 발화점에서 {dist}")
+
+        with impact_col2:
+            st.markdown("**권고 조치사항**")
+            recs = [
+                "🚁 산림청 진화헬기 즉시 출동 (반경 5km)",
+                "🚒 산불특수진화대 3개팀 사전 배치",
+                "📢 인근 주민 대피 안내방송 발령",
+                "🚧 등산로 입구 입산통제 시행",
+            ]
+            for r in recs:
+                st.markdown(f"- {r}")
+
+        st.info("💡 본 분석 결과는 의사결정 지원 목적이며, 실제 대응은 산림청·소방청 현장 지휘부 판단에 따라야 합니다.")
 
 
 # ──────────────────────────────────────────────
