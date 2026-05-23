@@ -4,14 +4,24 @@ ForestFire-GPT 통합 대시보드
 - 확산 시뮬레이션
 - LLM 자연어 에이전트
 """
+import os
+import sys
 import streamlit as st
 import pandas as pd
 import numpy as np
 import folium
 from streamlit_folium import st_folium
 import pickle
-import os
 from fire_spread import initialize_grid, simulate, burned_area_km2, BURNING, BURNED, TREE
+
+# 모델 파일이 없으면 자동 학습 (Streamlit Cloud 첫 실행 대비)
+if not os.path.exists('models/fire_risk.pkl'):
+    os.makedirs('models', exist_ok=True)
+    try:
+        from model_train import train
+        train()
+    except Exception as e:
+        print(f"모델 자동 학습 실패: {e}", file=sys.stderr)
 
 # ──────────────────────────────────────────────
 # 페이지 설정
