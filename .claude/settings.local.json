@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python --version)",
+      "PowerShell(pip --version)",
+      "PowerShell(cd \"C:\\\\Users\\\\user\\\\Downloads\\\\공모전\\\\국립산림과학원 제1회 산림과학 AI 활용 경진대회\\\\forestFire-gpt\"; $env:PYTHONIOENCODING=\"utf-8\"; python model_train.py 2>&1)"
+    ]
+  }
+}

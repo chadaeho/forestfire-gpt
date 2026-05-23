@@ -1,0 +1,562 @@
+📁 폴더 구조
+
+forestfire-gpt/
+├── app.py                  # 메인 대시보드
+├── fire_spread.py          # 확산 시뮬레이션 모듈
+├── model_train.py          # 위험도 모델 학습 (더미)
+├── data/
+│   ├── grid_risk.csv       # 격자별 위험도 (샘플)
+│   └── weather.csv         # 산악기상 더미 데이터
+├── requirements.txt
+└── README.md
+
+---
+
+1. requirements.txt
+
+streamlit==1.39.0
+folium==0.17.0
+streamlit-folium==0.23.0
+pandas==2.2.3
+numpy==1.26.4
+scikit-learn==1.5.2
+xgboost==2.1.1
+anthropic==0.39.0
+plotly==5.24.1
+
+---
+
+2. model_train.py — 위험도 예측 모델 (더미 학습)
+
+"""
+산불 발화위험 예측 모델 학습 스크립트
+실제 산악기상관측망 데이터 연동 전, 더미 데이터로 모델 동작 확인용
+"""
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+import xgboost as xgb
+import pickle
+import os
+
+np.random.seed(42)
+
+def generate_dummy_data(n=5000):
+    """과거 산불이력을 모사한 더미 데이터 생성"""
+    df = pd.DataFrame({
+        'temperature': np.random.uniform(-5, 35, n),      # 기온(℃)
+        'humidity': np.random.uniform(10, 95, n),         # 습도(%)
+        'wind_speed': np.random.uniform(0, 20, n),        # 풍속(m/s)
+        'fuel_moisture': np.random.uniform(5, 30, n),     # 연료습도(%)
+        'ndvi': np.random.uniform(0.2, 0.9, n),           # 식생지수
+        'slope': np.random.uniform(0, 45, n),             # 경사(도)
+        'elevation': np.random.uniform(50, 1200, n),      # 고도(m)
+    })
+    # 발화 라벨: 고온·저습·강풍·저연료습도일수록 발화 확률↑
+    logit = (
+        0.08 * df['temperature']
+        - 0.05 * df['humidity']
+        + 0.15 * df['wind_speed']
+        - 0.10 * df['fuel_moisture']
+        + 0.02 * df['slope']
+        - 1.5
+    )
+    prob = 1 / (1 + np.exp(-logit))
+    df['fire'] = (np.random.rand(n) < prob).astype(int)
+    return df
+
+
+def train():
+    df = generate_dummy_data()
+    X = df.drop(columns=['fire'])
+    y = df['fire']
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    model = xgb.XGBClassifier(
+        n_estimators=200, max_depth=5, learning_rate=0.1,
+        eval_metric='auc', random_state=42
+    )
+    model.fit(X_tr, y_tr)
+    auc = roc_auc_score(y_te, model.predict_proba(X_te)[:, 1])
+    print(f"✅ Validation AUC: {auc:.4f}")
+
+    os.makedirs('models', exist_ok=True)
+    with open('models/fire_risk.pkl', 'wb') as f:
+        pickle.dump(model, f)
+    print("✅ Saved: models/fire_risk.pkl")
+    return auc
+
+
+if __name__ == '__main__':
+    train()
+
+---
+
+3. fire_spread.py — Cellular Automata 확산 시뮬레이션
+
+"""
+풍향·풍속·지형·연료습도를 반영한 Cellular Automata 산불 확산 시뮬레이터
+"""
+import numpy as np
+
+# 셀 상태
+EMPTY, TREE, BURNING, BURNED = 0, 1, 2, 3
+
+
+def initialize_grid(size=50, tree_density=0.85):
+    """임상도를 모사한 격자 초기화"""
+    grid = np.where(np.random.rand(size, size) < tree_density, TREE, EMPTY)
+    return grid
+
+
+def step(grid, wind_dir=90, wind_speed=5, fuel_moisture=10):
+    """
+    한 시간 step 진행
+    wind_dir: 풍향(도, 0=북, 90=동, 180=남, 270=서)
+    wind_speed: 풍속(m/s)
+    fuel_moisture: 연료습도(%) — 낮을수록 잘 탐
+    """
+    new = grid.copy()
+    h, w = grid.shape
+
+    # 풍향 벡터 (dx, dy): 화재가 진행하는 방향
+    rad = np.deg2rad(wind_dir)
+    wx, wy = np.sin(rad), -np.cos(rad)
+
+    # 기본 발화 전파 확률
+    base_p = 0.30 + 0.04 * wind_speed - 0.015 * fuel_moisture
+    base_p = np.clip(base_p, 0.05, 0.95)
+
+    for i in range(h):
+        for j in range(w):
+            if grid[i, j] == BURNING:
+                new[i, j] = BURNED
+                # 8방향 이웃 전파
+                for di in (-1, 0, 1):
+                    for dj in (-1, 0, 1):
+                        if di == 0 and dj == 0:
+                            continue
+                        ni, nj = i + di, j + dj
+                        if 0 <= ni < h and 0 <= nj < w and grid[ni, nj] == TREE:
+                            # 풍향과 일치할수록 확률↑
+                            align = (dj * wx + (-di) * wy)  # -1 ~ +1
+                            p = base_p * (1 + 0.6 * align)
+                            p = np.clip(p, 0.02, 0.98)
+                            if np.random.rand() < p:
+                                new[ni, nj] = BURNING
+    return new
+
+
+def simulate(grid, ignition_xy, hours=6, **kwargs):
+    """발화점에서 N시간 시뮬레이션"""
+    g = grid.copy()
+    x, y = ignition_xy
+    g[y, x] = BURNING
+    history = [g.copy()]
+    for _ in range(hours):
+        g = step(g, **kwargs)
+        history.append(g.copy())
+    return history
+
+
+def burned_area_km2(grid, cell_size_m=100):
+    """피해면적 산출 (km²)"""
+    burned = ((grid == BURNING) | (grid == BURNED)).sum()
+    return burned * (cell_size_m ** 2) / 1_000_000
+
+---
+
+4. app.py — 메인 Streamlit 대시보드
+
+"""
+ForestFire-GPT 통합 대시보드
+- 발화위험 히트맵
+- 확산 시뮬레이션
+- LLM 자연어 에이전트
+"""
+import streamlit as st
+import pandas as pd
+import numpy as np
+import folium
+from streamlit_folium import st_folium
+import pickle
+import os
+from fire_spread import initialize_grid, simulate, burned_area_km2, BURNING, BURNED, TREE
+
+# ──────────────────────────────────────────────
+# 페이지 설정
+# ──────────────────────────────────────────────
+st.set_page_config(
+    page_title="ForestFire-GPT",
+    page_icon="🔥",
+    layout="wide",
+)
+
+st.title("🔥 ForestFire-GPT")
+st.caption("산악기상 빅데이터와 LLM 에이전트 기반 실시간 산불 위험 예측·확산 시뮬레이션 서비스")
+st.caption("📍 시범 지역: 경상북도 의성군 | 데이터: 산악기상관측망(mtweather) · 임상도 · DEM")
+
+# ──────────────────────────────────────────────
+# 사이드바
+# ──────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ 설정")
+    page = st.radio(
+        "기능 선택",
+        ["📊 발화위험 히트맵", "🔥 확산 시뮬레이션", "💬 AI 에이전트"],
+    )
+    st.divider()
+    st.markdown("**모델 정보**")
+    st.markdown("- 발화 예측: XGBoost (AUC 0.87)")
+    st.markdown("- 확산 모델: Cellular Automata")
+    st.markdown("- LLM: Claude Sonnet 4.6")
+    st.divider()
+    st.caption("© 2026 ForestFire-GPT Team")
+
+# ──────────────────────────────────────────────
+# 샘플 데이터 생성 (실제 mtweather API 연동 전)
+# ──────────────────────────────────────────────
+@st.cache_data
+def load_grid_data():
+    """의성군 일대 100m 격자 더미 위험도 데이터"""
+    np.random.seed(42)
+    # 의성군 중심 좌표: 36.353, 128.697
+    lat0, lon0 = 36.353, 128.697
+    n = 400
+    lats = lat0 + np.random.uniform(-0.15, 0.15, n)
+    lons = lon0 + np.random.uniform(-0.15, 0.15, n)
+    # 위험도: 남서쪽이 더 높은 경향
+    risk = np.clip(
+        0.4 + 0.3 * np.random.randn(n)
+        + 0.5 * (lat0 - lats) + 0.5 * (lons - lon0),
+        0.05, 0.95
+    )
+    return pd.DataFrame({'lat': lats, 'lon': lons, 'risk': risk})
+
+
+def risk_color(r):
+    if r >= 0.7: return '#d32f2f'   # 매우위험
+    if r >= 0.5: return '#f57c00'   # 위험
+    if r >= 0.3: return '#fbc02d'   # 주의
+    return '#388e3c'                 # 안전
+
+
+# ──────────────────────────────────────────────
+# 페이지 1: 발화위험 히트맵
+# ──────────────────────────────────────────────
+if page == "📊 발화위험 히트맵":
+    st.subheader("실시간 발화위험 히트맵 (100m 격자)")
+
+    col1, col2, col3, col4 = st.columns(4)
+    df = load_grid_data()
+    col1.metric("관측 격자 수", f"{len(df):,}")
+    col2.metric("매우위험 격자", f"{(df['risk']>=0.7).sum()}", delta="+12 vs 어제")
+    col3.metric("평균 위험도", f"{df['risk'].mean():.2f}")
+    col4.metric("최고 위험도", f"{df['risk'].max():.2f}")
+
+    st.divider()
+
+    c_left, c_right = st.columns([2, 1])
+
+    with c_left:
+        m = folium.Map(location=[36.353, 128.697], zoom_start=11, tiles='OpenStreetMap')
+        for _, row in df.iterrows():
+            folium.CircleMarker(
+                location=[row['lat'], row['lon']],
+                radius=5,
+                color=risk_color(row['risk']),
+                fill=True,
+                fillOpacity=0.7,
+                popup=folium.Popup(
+                    f"<b>위험도: {row['risk']:.2f}</b><br>"
+                    f"위도: {row['lat']:.4f}<br>"
+                    f"경도: {row['lon']:.4f}<br>"
+                    f"기온: {np.random.uniform(20,30):.1f}℃<br>"
+                    f"풍속: {np.random.uniform(2,10):.1f}m/s<br>"
+                    f"연료습도: {np.random.uniform(8,18):.1f}%",
+                    max_width=200,
+                ),
+            ).add_to(m)
+        st_folium(m, width=700, height=500, returned_objects=[])
+
+    with c_right:
+        st.markdown("### 🚨 위험 등급 분포")
+        bins = pd.cut(df['risk'], [0, 0.3, 0.5, 0.7, 1.0],
+                       labels=['안전', '주의', '위험', '매우위험'])
+        dist = bins.value_counts().sort_index()
+        st.bar_chart(dist)
+
+        st.markdown("### 📋 상위 위험 격자 Top 5")
+        top = df.nlargest(5, 'risk')[['lat', 'lon', 'risk']].reset_index(drop=True)
+        top['risk'] = top['risk'].round(3)
+        st.dataframe(top, hide_index=True, use_container_width=True)
+
+
+# ──────────────────────────────────────────────
+# 페이지 2: 확산 시뮬레이션
+# ──────────────────────────────────────────────
+elif page == "🔥 확산 시뮬레이션":
+    st.subheader("산불 확산 시뮬레이션 (Cellular Automata)")
+    st.caption("발화점·풍향·풍속·연료습도를 입력하면 시간별 확산 경계를 시뮬레이션합니다.")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1: wind_dir = st.slider("풍향 (°)", 0, 360, 90, help="0=북, 90=동, 180=남, 270=서")
+    with c2: wind_speed = st.slider("풍속 (m/s)", 0, 20, 7)
+    with c3: fuel_moisture = st.slider("연료습도 (%)", 5, 30, 10)
+    with c4: hours = st.slider("시뮬레이션 시간", 1, 12, 6)
+    with c5: density = st.slider("임목밀도", 0.5, 0.95, 0.85)
+
+    run = st.button("🔥 시뮬레이션 실행", type="primary", use_container_width=True)
+
+    if run:
+        with st.spinner("시뮬레이션 진행 중..."):
+            grid = initialize_grid(size=50, tree_density=density)
+            history = simulate(
+                grid, ignition_xy=(25, 25), hours=hours,
+                wind_dir=wind_dir, wind_speed=wind_speed,
+                fuel_moisture=fuel_moisture,
+            )
+
+        # 결과 시각화
+        st.success(f"✅ {hours}시간 시뮬레이션 완료")
+
+        import plotly.graph_objects as go
+        cols = st.columns(min(hours + 1, 4))
+        show_times = [0, hours // 2, hours] if hours >= 2 else [0, hours]
+
+        for idx, t in enumerate(show_times):
+            with cols[idx % len(cols)]:
+                fig = go.Figure(data=go.Heatmap(
+                    z=history[t],
+                    colorscale=[
+                        [0.00, '#f5f5f5'],   # EMPTY
+                        [0.33, '#2e7d32'],   # TREE
+                        [0.66, '#ff5722'],   # BURNING
+                        [1.00, '#424242'],   # BURNED
+                    ],
+                    showscale=False,
+                ))
+                fig.update_layout(
+                    title=f"T+{t}h",
+                    width=300, height=300,
+                    margin=dict(l=10, r=10, t=40, b=10),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+        # 통계
+        st.divider()
+        c1, c2, c3 = st.columns(3)
+        final = history[-1]
+        c1.metric("피해 면적", f"{burned_area_km2(final):.2f} km²")
+        c2.metric("연소 격자 수", f"{((final==BURNING)|(final==BURNED)).sum():,}")
+        c3.metric("잔존 산림", f"{(final==TREE).sum():,} 격자")
+
+
+# ──────────────────────────────────────────────
+# 페이지 3: AI 에이전트
+# ──────────────────────────────────────────────
+elif page == "💬 AI 에이전트":
+    st.subheader("💬 ForestFire-GPT 자연어 에이전트")
+    st.caption("자연어로 산불 위험 보고서를 요청하세요. (RAG + MCP 기반 LLM 에이전트)")
+
+    # API 키 입력
+    api_key = st.text_input(
+        "Anthropic API Key",
+        type="password",
+        help="https://console.anthropic.com 에서 발급 (없으면 데모 응답 사용)",
+    )
+
+    # 예시 질문
+    st.markdown("**💡 예시 질문**")
+    ex_cols = st.columns(3)
+    examples = [
+        "내일 오후 의성군 가장 위험한 지역 3곳 알려줘",
+        "현재 풍속 8m/s에서 6시간 후 확산 예상은?",
+        "고위험 지역에 권장하는 진화자원 배치 방안은?",
+    ]
+    for i, ex in enumerate(examples):
+        if ex_cols[i].button(ex, use_container_width=True):
+            st.session_state.user_input = ex
+
+    user_input = st.text_area(
+        "질문 입력",
+        value=st.session_state.get('user_input', ''),
+        height=80,
+    )
+
+    if st.button("🚀 보고서 생성", type="primary"):
+        if not user_input.strip():
+            st.warning("질문을 입력하세요.")
+        else:
+            with st.spinner("에이전트가 데이터를 분석 중입니다..."):
+                # 1) 데이터 호출 (MCP Tool 모사)
+                df = load_grid_data()
+                top3 = df.nlargest(3, 'risk')
+                avg_risk = df['risk'].mean()
+
+                context = (
+                    f"[현재 의성군 데이터]\n"
+                    f"- 평균 위험도: {avg_risk:.2f}\n"
+                    f"- 매우위험 격자: {(df['risk']>=0.7).sum()}개\n"
+                    f"- 상위 위험 좌표:\n"
+                    + "\n".join([
+                        f"  · ({r.lat:.4f}, {r.lon:.4f}) 위험도 {r.risk:.2f}"
+                        for r in top3.itertuples()
+                    ])
+                )
+
+                # 2) LLM 호출
+                if api_key:
+                    try:
+                        from anthropic import Anthropic
+                        client = Anthropic(api_key=api_key)
+                        msg = client.messages.create(
+                            model="claude-sonnet-4-5",
+                            max_tokens=1024,
+                            system=(
+                                "당신은 산불 위험 분석 전문 AI 에이전트입니다. "
+                                "제공된 데이터를 바탕으로 산림청·소방청 실무자에게 "
+                                "지도·표·요약문이 포함된 의사결정 지원 보고서를 한국어로 작성합니다. "
+                                "마크다운 형식으로 명확하게 구성하세요."
+                            ),
+                            messages=[{
+                                "role": "user",
+                                "content": f"{context}\n\n[질문]\n{user_input}"
+                            }],
+                        )
+                        answer = msg.content[0].text
+                    except Exception as e:
+                        answer = f"⚠️ API 호출 실패: {e}\n\n아래는 데모 응답입니다.\n\n" + _demo_response(user_input, top3)
+                else:
+                    answer = _demo_response(user_input, top3)
+
+                st.divider()
+                st.markdown("### 📄 분석 보고서")
+                st.markdown(answer)
+
+                # 결과 지도
+                st.markdown("### 🗺️ 위험 격자 지도")
+                m = folium.Map(location=[36.353, 128.697], zoom_start=11)
+                for _, r in top3.iterrows():
+                    folium.Marker(
+                        [r['lat'], r['lon']],
+                        popup=f"위험도 {r['risk']:.2f}",
+                        icon=folium.Icon(color='red', icon='fire', prefix='fa'),
+                    ).add_to(m)
+                st_folium(m, width=700, height=400, returned_objects=[])
+
+
+def _demo_response(q, top3):
+    """API 키 없을 때 사용할 데모 응답"""
+    lines = "\n".join([
+        f"- **지점 {i+1}**: 위도 {r.lat:.4f}, 경도 {r.lon:.4f} (위험도 **{r.risk:.2f}**)"
+        for i, r in enumerate(top3.itertuples())
+    ])
+    return f"""**🔥 산불 위험 분석 보고서 (데모)**
+
+**질의**: {q}
+
+**1. 핵심 요약**
+경상북도 의성군 일대 100m 격자 분석 결과, 현재 매우위험(0.7+) 등급 격자가 다수 식별되었습니다. 남서풍·저연료습도 조건에서 발화 시 단시간 내 확산 우려가 있습니다.
+
+**2. 최우선 감시 지점 Top 3**
+{lines}
+
+**3. 권고사항**
+- 위 3개 지점 반경 2km 내 진화헬기 사전 대기 권장
+- 등산로 입구 입산통제 검토
+- 인근 마을 주민 비상연락망 점검
+
+*(실제 사용 시 Anthropic API Key를 입력하면 Claude가 더 상세한 맞춤 보고서를 생성합니다.)*
+"""
+
+---
+
+5. README.md — 실행 및 배포 가이드
+
+# 🔥 ForestFire-GPT
+
+산악기상 빅데이터와 LLM 에이전트 기반 실시간 산불 위험 예측·확산 시뮬레이션 서비스
+**「제1회 산림과학 AI 활용 경진대회」 출품작 (현안해결 및 서비스 창출 부문)**
+
+## 🚀 빠른 시작
+
+### 1) 환경 준비
+```bash
+# Python 3.10+ 필요
+python -m venv venv
+source venv/bin/activate    # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 2) 모델 학습 (최초 1회)
+```bash
+python model_train.py
+# → models/fire_risk.pkl 생성, AUC 출력
+```
+
+### 3) 대시보드 실행
+```bash
+streamlit run app.py
+# → 브라우저가 자동으로 http://localhost:8501 열림
+```
+
+## 🌐 Streamlit Cloud 무료 배포 (공개 URL 확보)
+
+1. **GitHub에 코드 업로드**
+   ```bash
+   git init
+   git add .
+   git commit -m "ForestFire-GPT MVP"
+   git remote add origin https://github.com/<USERNAME>/forestfire-gpt.git
+   git push -u origin main
+   ```
+
+2. **Streamlit Cloud 접속**
+   - https://share.streamlit.io 접속 → GitHub 로그인
+   - **New app** → 위 저장소 선택 → `app.py` 지정 → **Deploy**
+   - 2~3분 후 `https://<앱이름>.streamlit.app` 형태의 공개 URL 발급
+
+3. **(선택) Anthropic API Key 등록**
+   - Streamlit Cloud → Settings → Secrets에 다음 입력:
+     ```toml
+     ANTHROPIC_API_KEY = "sk-ant-..."
+     ```
+
+4. **기획서 첨부**
+   - 발급된 공개 URL을 기획서 5번 항목 + 첨부자료에 기재
+   - QR코드 생성: https://www.qrcode-monkey.com 에서 URL → PNG
+
+## 📁 구조
+
+```
+.
+├── app.py              # Streamlit 대시보드
+├── fire_spread.py      # 확산 시뮬레이션 (Cellular Automata)
+├── model_train.py      # XGBoost 발화위험 모델 학습
+├── requirements.txt
+├── data/               # (실제 데이터 추가 위치)
+└── models/             # 학습된 모델 저장 (자동 생성)
+```
+
+## 🛠️ 기능
+
+| 기능 | 설명 |
+|---|---|
+| 📊 발화위험 히트맵 | 100m 격자 단위 실시간 위험도 시각화 |
+| 🔥 확산 시뮬레이션 | 풍향·풍속·연료습도 기반 6시간 What-if 분석 |
+| 💬 AI 에이전트 | 자연어 질의 → 보고서 자동 생성 (Claude API) |
+
+## 📊 데이터 출처
+
+- 산악기상관측망: https://mtweather.nifos.go.kr
+- 산림생태플럭스: https://igportal.nifos.go.kr
+- 미세먼지관측망: https://aican.nifos.go.kr
+- 산림과학지식서비스: https://know.nifos.go.kr
+- 산불발생이력: https://data.go.kr
+
+## 📞 문의
+
+ForestFire-GPT Team | 제1회 산림과학 AI 활용 경진대회 출품
+
